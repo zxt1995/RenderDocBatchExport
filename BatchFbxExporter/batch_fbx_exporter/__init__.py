@@ -268,7 +268,10 @@ def export_fbx(save_path, mapper, data, attr_list, controller):
     if not data:
         return False
 
-    save_name = os.path.basename(os.path.splitext(save_path)[0])
+    # Get filename without extension (e.g., "1" from "1.fbx")
+    base_name = os.path.basename(os.path.splitext(save_path)[0])
+    # Format as mesh_N for FBX internal naming
+    save_name = "mesh_{0}".format(base_name)
 
     # We'll decode the first three indices making up a triangle
     idx_dict = data["IDX"]
@@ -667,10 +670,225 @@ def export_fbx(save_path, mapper, data, attr_list, controller):
     return True
 
 
+# ==================== Matrix Transform Functions ====================
+
+def read_matrix_from_renderdoc(controller, target_set, target_binding, variable_name, log_func=None):
+    """Read transformation matrix from RenderDoc constant buffer
+    
+    Args:
+        controller: RenderDoc controller
+        target_set: Descriptor set number
+        target_binding: Binding number
+        variable_name: Variable name in constant buffer
+        log_func: Optional logging function
+    
+    Returns:
+        tuple of 16 floats (4x4 matrix) or None if failed
+    """
+    def log(msg):
+        if log_func:
+            log_func(msg)
+        else:
+            print(msg)
+    
+    try:
+        import struct
+        
+        # Get pipeline state
+        state = controller.GetPipelineState()
+        if not state:
+            log("Error: No pipeline state")
+            return None
+        
+        # Get shader reflection
+        shader_refl = state.GetShaderReflection(rd.ShaderStage.Vertex)
+        if not shader_refl:
+            log("Error: No shader reflection")
+            return None
+        
+        # Get runtime constant blocks
+        runtime_cbs = state.GetConstantBlocks(rd.ShaderStage.Vertex)
+        
+        # Search through constant blocks in shader reflection
+        for cb_index, cb_refl in enumerate(shader_refl.constantBlocks):
+            # Check if this CB matches our target set and binding
+            if not hasattr(cb_refl, 'fixedBindSetOrSpace') or not hasattr(cb_refl, 'fixedBindNumber'):
+                continue
+            
+            cb_set = cb_refl.fixedBindSetOrSpace
+            cb_binding = cb_refl.fixedBindNumber
+            
+            if cb_set == target_set and cb_binding == target_binding:
+                # Search for the variable
+                var_found = False
+                var_offset = 0
+                
+                for var in cb_refl.variables:
+                    if hasattr(var, 'name') and var.name == variable_name:
+                        var_found = True
+                        if hasattr(var, 'offset'):
+                            var_offset = var.offset
+                        break
+                
+                if not var_found:
+                    log("Variable '{0}' not found in buffer {1}".format(variable_name, cb_refl.name))
+                    return None
+                
+                # Read buffer data from runtime constant block
+                if cb_index >= len(runtime_cbs):
+                    log("Error: Runtime CB index out of range")
+                    return None
+                
+                runtime_cb = runtime_cbs[cb_index]
+                if not hasattr(runtime_cb, 'descriptor'):
+                    log("Error: Runtime CB has no descriptor")
+                    return None
+                
+                desc = runtime_cb.descriptor
+                if not hasattr(desc, 'resource'):
+                    log("Error: Descriptor has no resource")
+                    return None
+                
+                res_id = desc.resource
+                buf_offset = desc.byteOffset if hasattr(desc, 'byteOffset') else 0
+                buf_size = desc.byteSize if hasattr(desc, 'byteSize') else cb_refl.byteSize
+                
+                # Read buffer data
+                buffer_data = controller.GetBufferData(res_id, buf_offset, buf_size)
+                
+                if len(buffer_data) < var_offset + 64:
+                    log("Error: Not enough data in buffer")
+                    return None
+                
+                # Extract matrix at variable offset
+                matrix = struct.unpack('16f', buffer_data[var_offset:var_offset+64])
+                
+                # Transpose matrix (Vulkan uses column-major, we need row-major)
+                # Original: column-major [col0, col1, col2, col3]
+                # Need: row-major [row0, row1, row2, row3]
+                transposed = (
+                    matrix[0], matrix[4], matrix[8], matrix[12],   # row 0
+                    matrix[1], matrix[5], matrix[9], matrix[13],   # row 1
+                    matrix[2], matrix[6], matrix[10], matrix[14],  # row 2
+                    matrix[3], matrix[7], matrix[11], matrix[15]   # row 3
+                )
+                return transposed
+        
+        log("No constant buffer found with Set={0}, Binding={1}".format(target_set, target_binding))
+        return None
+        
+    except Exception as e:
+        log("Error reading matrix: {0}".format(str(e)))
+        return None
+
+
+def transform_vertices_with_matrix(data, matrix, mapper):
+    """Apply 4x4 transform matrix to vertex data
+    
+    Args:
+        data: Dictionary with vertex data, keys are actual attribute names (e.g., "_input0")
+        matrix: 4x4 transformation matrix (16 floats)
+        mapper: Dictionary mapping semantic names to actual attribute names
+                e.g., {'POSITION': '_input0', 'NORMAL': '_input1'}
+    """
+    if not matrix:
+        return data
+    
+    # Get actual attribute names from mapper
+    position_key = mapper.get('POSITION', '')
+    normal_key = mapper.get('NORMAL', '')
+    tangent_key = mapper.get('TANGENT', '')
+    binormal_key = mapper.get('BINORMAL', '')
+    
+    # Transform POSITION
+    if position_key and position_key in data:
+        transformed_positions = []
+        for pos in data[position_key]:
+            x, y, z = pos[:3] if len(pos) >= 3 else (pos[0] if len(pos) >= 1 else 0, pos[1] if len(pos) >= 2 else 0, 0)
+            
+            # Matrix multiplication: pos_world = Matrix × pos_local
+            # Matrix is in row-major order: [m00,m01,m02,m03, m10,m11,m12,m13, ...]
+            x_new = matrix[0]*x + matrix[1]*y + matrix[2]*z  + matrix[3]
+            y_new = matrix[4]*x + matrix[5]*y + matrix[6]*z  + matrix[7]
+            z_new = matrix[8]*x + matrix[9]*y + matrix[10]*z + matrix[11]
+            
+            transformed_positions.append((x_new, y_new, z_new))
+        
+        data[position_key] = transformed_positions
+    
+    # Transform NORMAL (rotation only, no translation)
+    if normal_key and normal_key in data:
+        transformed_normals = []
+        for norm in data[normal_key]:
+            x, y, z = norm[:3] if len(norm) >= 3 else (norm[0] if len(norm) >= 1 else 0, norm[1] if len(norm) >= 2 else 0, 0)
+            
+            # Use rotation part only (3x3 upper-left)
+            x_new = matrix[0]*x + matrix[1]*y + matrix[2]*z
+            y_new = matrix[4]*x + matrix[5]*y + matrix[6]*z
+            z_new = matrix[8]*x + matrix[9]*y + matrix[10]*z
+            
+            # Normalize
+            length = (x_new*x_new + y_new*y_new + z_new*z_new) ** 0.5
+            if length > 0.0001:
+                transformed_normals.append((x_new/length, y_new/length, z_new/length))
+            else:
+                transformed_normals.append(norm)
+        
+        data[normal_key] = transformed_normals
+    
+    # Transform TANGENT (rotation only)
+    if tangent_key and tangent_key in data:
+        transformed_tangents = []
+        for tang in data[tangent_key]:
+            x, y, z = tang[:3] if len(tang) >= 3 else (tang[0] if len(tang) >= 1 else 0, tang[1] if len(tang) >= 2 else 0, 0)
+            
+            x_new = matrix[0]*x + matrix[1]*y + matrix[2]*z
+            y_new = matrix[4]*x + matrix[5]*y + matrix[6]*z
+            z_new = matrix[8]*x + matrix[9]*y + matrix[10]*z
+            
+            length = (x_new*x_new + y_new*y_new + z_new*z_new) ** 0.5
+            if length > 0.0001:
+                transformed_tangents.append((x_new/length, y_new/length, z_new/length))
+            else:
+                transformed_tangents.append(tang)
+        
+        data[tangent_key] = transformed_tangents
+    
+    # Transform BINORMAL (rotation only)
+    if binormal_key and binormal_key in data:
+        transformed_binormals = []
+        for binorm in data[binormal_key]:
+            x, y, z = binorm[:3] if len(binorm) >= 3 else (binorm[0] if len(binorm) >= 1 else 0, binorm[1] if len(binorm) >= 2 else 0, 0)
+            
+            x_new = matrix[0]*x + matrix[1]*y + matrix[2]*z
+            y_new = matrix[4]*x + matrix[5]*y + matrix[6]*z
+            z_new = matrix[8]*x + matrix[9]*y + matrix[10]*z
+            
+            length = (x_new*x_new + y_new*y_new + z_new*z_new) ** 0.5
+            if length > 0.0001:
+                transformed_binormals.append((x_new/length, y_new/length, z_new/length))
+            else:
+                transformed_binormals.append(binorm)
+        
+        data[binormal_key] = transformed_binormals
+    
+    return data
+
+
 # ==================== Batch Export Logic ====================
 
-def export_draw_call(controller, draw, mapper, output_folder, log_window=None):
-    """Export a single draw call to FBX and textures"""
+def export_draw_call(controller, draw, mapper, output_folder, log_window=None, draw_index=None, matrix_config=None):
+    """Export a single draw call to FBX and textures
+    
+    Args:
+        controller: RenderDoc controller
+        draw: Draw call to export
+        mapper: Attribute mapping dictionary
+        output_folder: Output directory
+        log_window: Optional log window for output
+        draw_index: DEPRECATED - no longer used, eventId is used instead
+        matrix_config: Optional dict with 'set', 'binding', 'variable' for real-time matrix reading
+    """
     def log(msg):
         if log_window:
             log_window.log(msg)
@@ -743,6 +961,57 @@ def export_draw_call(controller, draw, mapper, output_folder, log_window=None):
         
         log("[EventID {0}] Extracted attributes: {1}".format(draw.eventId, ", ".join(sorted(attr_list))))
         
+        # Read and apply transform matrix in real-time if config provided
+        if matrix_config:
+            log("[EventID {0}] Reading transform matrix from RenderDoc...".format(draw.eventId))
+            log("[EventID {0}]   Set: {1}, Binding: {2}, Variable: {3}".format(
+                draw.eventId, matrix_config['set'], matrix_config['binding'], matrix_config['variable']))
+            
+            # Read matrix for this specific EventID
+            transform_matrix = read_matrix_from_renderdoc(
+                controller,
+                matrix_config['set'],
+                matrix_config['binding'],
+                matrix_config['variable'],
+                log
+            )
+            
+            if transform_matrix:
+                # 显示矩阵值
+                log("[EventID {0}] Matrix: [{1:.2f}, {2:.2f}, {3:.2f}, {4:.2f}]".format(
+                    draw.eventId, transform_matrix[0], transform_matrix[1], transform_matrix[2], transform_matrix[3]))
+                log("[EventID {0}]         [{1:.2f}, {2:.2f}, {3:.2f}, {4:.2f}]".format(
+                    draw.eventId, transform_matrix[4], transform_matrix[5], transform_matrix[6], transform_matrix[7]))
+                log("[EventID {0}]         [{1:.2f}, {2:.2f}, {3:.2f}, {4:.2f}]".format(
+                    draw.eventId, transform_matrix[8], transform_matrix[9], transform_matrix[10], transform_matrix[11]))
+                log("[EventID {0}]         [{1:.2f}, {2:.2f}, {3:.2f}, {4:.2f}]".format(
+                    draw.eventId, transform_matrix[12], transform_matrix[13], transform_matrix[14], transform_matrix[15]))
+                
+                # Get the actual position attribute name from mapper
+                position_key = mapper.get('POSITION', '')
+                log("[EventID {0}] Position attribute mapped to: '{1}'".format(draw.eventId, position_key))
+                
+                # 显示变换前的第一个顶点
+                if position_key and position_key in data and len(data[position_key]) > 0:
+                    first_pos = data[position_key][0]
+                    log("[EventID {0}] First vertex before: ({1:.3f}, {2:.3f}, {3:.3f})".format(
+                        draw.eventId, first_pos[0], first_pos[1], first_pos[2]))
+                
+                # Apply transformation
+                data = transform_vertices_with_matrix(data, transform_matrix, mapper)
+                
+                # 显示变换后的第一个顶点
+                if position_key and position_key in data and len(data[position_key]) > 0:
+                    first_pos = data[position_key][0]
+                    log("[EventID {0}] First vertex after:  ({1:.3f}, {2:.3f}, {3:.3f})".format(
+                        draw.eventId, first_pos[0], first_pos[1], first_pos[2]))
+                
+                log("[EventID {0}] ✓ Transform applied".format(draw.eventId))
+            else:
+                log("[EventID {0}] ⚠ Failed to read matrix, using original coordinates".format(draw.eventId))
+        else:
+            log("[EventID {0}] ℹ No transform config provided (using original coordinates)".format(draw.eventId))
+        
         # Export textures
         state = controller.GetPipelineState()
         texture_count = 0
@@ -773,7 +1042,10 @@ def export_draw_call(controller, draw, mapper, output_folder, log_window=None):
         if not os.path.exists(event_folder):
             os.makedirs(event_folder)
         
-        fbx_path = os.path.join(event_folder, "model.fbx")
+        # Use eventId for filename (e.g., 832.fbx)
+        # This ensures FBX internal mesh name will be mesh_832
+        fbx_filename = "{0}.fbx".format(draw.eventId)
+        fbx_path = os.path.join(event_folder, fbx_filename)
         success = export_fbx(fbx_path, mapper, data, attr_list, controller)
         
         if success:
@@ -829,7 +1101,7 @@ def prepare_batch_export(pyrenderdoc, data):
     manager = pyrenderdoc.Extensions()
     
     mqt = manager.GetMiniQtHelper()
-    dialog = BatchExportDialog(mqt)
+    dialog = BatchExportDialog(mqt, pyrenderdoc)
     
     # Show configuration dialog
     if not mqt.ShowWidgetAsDialog(dialog.init_ui()):
@@ -844,14 +1116,19 @@ def prepare_batch_export(pyrenderdoc, data):
     
     # Create worker thread
     from .export_worker import ExportWorker
+    
+    # Get matrix config (may be None if widget failed to load or disabled)
+    matrix_config = getattr(dialog, 'matrix_config', None)
+    
     worker = ExportWorker(
         pyrenderdoc,
         dialog.start_index,
         dialog.end_index,
         dialog.output_folder,
         dialog.mapper,
-        find_draws_in_range,  # Pass function reference
-        export_draw_call       # Pass function reference
+        find_draws_in_range,   # Pass function reference
+        export_draw_call,      # Pass function reference
+        matrix_config           # Pass matrix config for real-time reading
     )
     
     # Connect worker signals to log window

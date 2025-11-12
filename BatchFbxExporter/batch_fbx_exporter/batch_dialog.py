@@ -12,8 +12,238 @@ __date__ = "2025-11-11"
 
 import os
 import tempfile
+import json
 from functools import partial
 from PySide2 import QtWidgets, QtCore, QtGui
+
+
+class MatrixInputWidget(QtWidgets.QGroupBox):
+    """Matrix Auto-Read Configuration Widget"""
+    
+    def __init__(self, parent=None, pyrenderdoc=None):
+        super(MatrixInputWidget, self).__init__("世界坐标变换矩阵 (自动读取)", parent)
+        self.pyrenderdoc = pyrenderdoc
+        self.setup_ui()
+    
+    def setup_ui(self):
+        main_layout = QtWidgets.QVBoxLayout(self)
+        
+        # 启用开关
+        self.enable_checkbox = QtWidgets.QCheckBox("启用世界坐标变换 (每个EventID实时读取)")
+        self.enable_checkbox.setStyleSheet("font-weight: bold; color: #2196F3;")
+        self.enable_checkbox.setToolTip("勾选后，每个EventID导出时都会实时从RenderDoc读取对应的变换矩阵")
+        main_layout.addWidget(self.enable_checkbox)
+        
+        # 说明文字
+        info_label = QtWidgets.QLabel(
+            "💡 提示: 插件将在每个EventID导出时，实时从当前DrawCall的Constant Buffer中读取变换矩阵"
+        )
+        info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px; background-color: #F5F5F5; border-radius: 4px;")
+        info_label.setWordWrap(True)
+        main_layout.addWidget(info_label)
+        
+        # 配置参数组
+        config_group = QtWidgets.QGroupBox("矩阵读取配置")
+        config_layout = QtWidgets.QGridLayout(config_group)
+        
+        # Set参数
+        config_layout.addWidget(QtWidgets.QLabel("Descriptor Set:"), 0, 0)
+        self.set_spin = QtWidgets.QSpinBox()
+        self.set_spin.setRange(0, 10)
+        self.set_spin.setValue(3)
+        self.set_spin.setFixedWidth(70)
+        self.set_spin.setToolTip("Vulkan Descriptor Set编号 (通常在RenderDoc Pipeline State中显示)")
+        config_layout.addWidget(self.set_spin, 0, 1)
+        
+        # Binding参数
+        config_layout.addWidget(QtWidgets.QLabel("Binding:"), 0, 2)
+        self.binding_spin = QtWidgets.QSpinBox()
+        self.binding_spin.setRange(0, 20)
+        self.binding_spin.setValue(1)
+        self.binding_spin.setFixedWidth(70)
+        self.binding_spin.setToolTip("Binding编号 (在对应的Descriptor Set中)")
+        config_layout.addWidget(self.binding_spin, 0, 3)
+        
+        # Variable名称
+        config_layout.addWidget(QtWidgets.QLabel("Variable名称:"), 1, 0)
+        self.variable_edit = QtWidgets.QLineEdit("_child0")
+        self.variable_edit.setPlaceholderText("如: _child0, _child1, World等")
+        self.variable_edit.setToolTip("Constant Buffer中变量的名称 (大小写敏感)")
+        config_layout.addWidget(self.variable_edit, 1, 1, 1, 3)
+        
+        # 设置列拉伸
+        config_layout.setColumnStretch(4, 1)
+        
+        main_layout.addWidget(config_group)
+        
+        # 测试按钮
+        test_layout = QtWidgets.QHBoxLayout()
+        self.test_button = QtWidgets.QPushButton("🔍 测试读取矩阵")
+        self.test_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        self.test_button.clicked.connect(self.test_read_matrix)
+        test_layout.addWidget(self.test_button)
+        test_layout.addStretch()
+        main_layout.addLayout(test_layout)
+        
+        # 使用说明
+        help_text = QtWidgets.QLabel(
+            "<b>使用步骤:</b><br>"
+            "1. 在RenderDoc中选择一个DrawCall<br>"
+            "2. 查看Pipeline State找到包含变换矩阵的Constant Buffer的Set和Binding<br>"
+            "3. 在Mesh Viewer中查看buffer内容，找到矩阵对应的Variable名称<br>"
+            "4. 点击'测试读取矩阵'验证配置是否正确<br>"
+            "5. 开始导出，每个EventID会自动读取对应的矩阵"
+        )
+        help_text.setStyleSheet("color: #444; font-size: 11px; padding: 10px; background-color: #E8F5E9; border-radius: 4px; border-left: 4px solid #4CAF50;")
+        help_text.setWordWrap(True)
+        main_layout.addWidget(help_text)
+        
+        # 连接启用开关
+        self.enable_checkbox.toggled.connect(config_group.setEnabled)
+        self.enable_checkbox.toggled.connect(self.test_button.setEnabled)
+        config_group.setEnabled(False)
+        self.test_button.setEnabled(False)
+    
+    def get_config(self):
+        """获取矩阵配置 (用于实时读取)"""
+        return {
+            'enabled': self.enable_checkbox.isChecked(),
+            'set': self.set_spin.value(),
+            'binding': self.binding_spin.value(),
+            'variable': self.variable_edit.text()
+        }
+    
+    def is_enabled(self):
+        """是否启用变换"""
+        return self.enable_checkbox.isChecked()
+    
+    def test_read_matrix(self):
+        """测试从RenderDoc读取矩阵"""
+        if not self.pyrenderdoc:
+            QtWidgets.QMessageBox.warning(self, "错误", "RenderDoc API 不可用")
+            return
+        
+        try:
+            import renderdoc as rd
+            import struct
+            
+            target_set = self.set_spin.value()
+            target_binding = self.binding_spin.value()
+            variable_name = self.variable_edit.text()
+            
+            if not variable_name:
+                QtWidgets.QMessageBox.warning(self, "错误", "请输入Variable名称")
+                return
+            
+            # 存储结果
+            result_matrix = [None]
+            error_message = [None]
+            
+            def read_matrix_test(controller):
+                try:
+                    # 导入必要的模块
+                    import sys
+                    import os
+                    # 导入 __init__.py 中的 read_matrix_from_renderdoc 函数
+                    sys.path.insert(0, os.path.dirname(__file__))
+                    from . import read_matrix_from_renderdoc
+                    
+                    # 简单的日志函数
+                    messages = []
+                    def log_func(msg):
+                        messages.append(msg)
+                    
+                    # 读取矩阵
+                    matrix = read_matrix_from_renderdoc(controller, target_set, target_binding, variable_name, log_func)
+                    
+                    if matrix:
+                        result_matrix[0] = matrix
+                    else:
+                        error_message[0] = "\n".join(messages) if messages else "无法读取矩阵"
+                except Exception as e:
+                    error_message[0] = str(e)
+            
+            # 执行测试
+            self.pyrenderdoc.Replay().BlockInvoke(read_matrix_test)
+            
+            # 显示结果
+            if result_matrix[0]:
+                matrix = result_matrix[0]
+                result_text = "✓ 成功读取矩阵:\n\n"
+                for i in range(4):
+                    row = matrix[i*4:(i+1)*4]
+                    result_text += "[{0:7.4f}, {1:7.4f}, {2:7.4f}, {3:7.4f}]\n".format(*row)
+                
+                result_text += "\n矩阵验证:\n"
+                result_text += "• matrix[15] = {0:.4f} (应接近1.0)\n".format(matrix[15])
+                
+                if abs(matrix[15] - 1.0) < 0.1:
+                    result_text += "• ✓ 验证通过\n"
+                else:
+                    result_text += "• ⚠ 警告: matrix[15]不接近1.0,请确认\n"
+                
+                QtWidgets.QMessageBox.information(self, '读取成功', result_text)
+            else:
+                error_text = "✗ 读取失败\n\n"
+                if error_message[0]:
+                    error_text += "错误信息:\n" + error_message[0]
+                else:
+                    error_text += "请检查:\n"
+                    error_text += "• Set和Binding是否正确\n"
+                    error_text += "• Variable名称是否正确（大小写敏感）\n"
+                    error_text += "• 是否已选中DrawCall\n"
+                    error_text += "• 是否为Vulkan API"
+                
+                QtWidgets.QMessageBox.warning(self, "读取失败", error_text)
+        
+        except Exception as e:
+            import traceback
+            error_text = "测试时出错:\n\n{0}\n\n{1}".format(str(e), traceback.format_exc())
+            QtWidgets.QMessageBox.critical(self, "错误", error_text)
+    
+    def save_to_settings(self, settings):
+        """保存到配置"""
+        settings.setValue("matrix_enabled", self.is_enabled())
+        
+        # 保存自动读取参数
+        settings.setValue("matrix_auto_set", self.set_spin.value())
+        settings.setValue("matrix_auto_binding", self.binding_spin.value())
+        settings.setValue("matrix_auto_variable", self.variable_edit.text())
+    
+    def load_from_settings(self, settings):
+        """从配置加载"""
+        enabled = settings.value("matrix_enabled", False)
+        # Convert string to bool if needed
+        if isinstance(enabled, str):
+            enabled = enabled.lower() == 'true'
+        self.enable_checkbox.setChecked(bool(enabled))
+        
+        # 加载自动读取参数
+        auto_set = settings.value("matrix_auto_set", 3)
+        auto_binding = settings.value("matrix_auto_binding", 1)
+        auto_variable = settings.value("matrix_auto_variable", "_child0")
+        
+        try:
+            self.set_spin.setValue(int(auto_set))
+            self.binding_spin.setValue(int(auto_binding))
+            self.variable_edit.setText(str(auto_variable))
+        except:
+            pass
 
 
 class BatchExportDialog(object):
@@ -40,8 +270,9 @@ class BatchExportDialog(object):
     end_index = 1000
     output_folder = ""
 
-    def __init__(self, mqt):
+    def __init__(self, mqt, pyrenderdoc=None):
         self.mqt = mqt
+        self.pyrenderdoc = pyrenderdoc
         name = "RenderDoc_%s.ini" % self.__class__.__name__
         path = os.path.join(tempfile.gettempdir(), name)
         self.settings = QtCore.QSettings(path, QtCore.QSettings.IniFormat)
@@ -242,6 +473,31 @@ class BatchExportDialog(object):
         
         self.mqt.AddWidget(self.widget, attr_group)
 
+        # ==================== Matrix Transform Section ====================
+        # 直接用Qt方式添加矩阵控件
+        try:
+            # 获取父widget的Qt对象
+            if hasattr(self.widget, 'Widget'):
+                parent_qt = self.widget.Widget()
+            else:
+                parent_qt = self.widget
+            
+            # 创建矩阵输入控件
+            self.matrix_widget = MatrixInputWidget(parent_qt, self.pyrenderdoc)
+            self.matrix_widget.load_from_settings(self.settings)
+            
+            # 直接添加到父widget的layout
+            if isinstance(parent_qt, QtWidgets.QWidget) and parent_qt.layout():
+                parent_qt.layout().addWidget(self.matrix_widget)
+            else:
+                print("Warning: Could not add matrix widget to layout")
+                self.matrix_widget = None
+        except Exception as e:
+            print("Warning: Could not create matrix widget: {0}".format(str(e)))
+            import traceback
+            traceback.print_exc()
+            self.matrix_widget = None
+
         # ==================== Action Buttons ====================
         button_container = self.mqt.CreateHorizontalContainer()
         ok_button = self.mqt.CreateButton(self.accept)
@@ -308,6 +564,29 @@ class BatchExportDialog(object):
         
         # Get output folder
         self.output_folder = self.mqt.GetWidgetText(self.folder_edit)
+        
+        # Save and get transform matrix configuration
+        if self.matrix_widget:
+            try:
+                self.matrix_widget.save_to_settings(self.settings)
+                self.matrix_config = self.matrix_widget.get_config()
+                if self.matrix_config.get('enabled', False):
+                    print("Transform matrix auto-read enabled:")
+                    print("  Set: {0}".format(self.matrix_config['set']))
+                    print("  Binding: {0}".format(self.matrix_config['binding']))
+                    print("  Variable: {0}".format(self.matrix_config['variable']))
+                    print("  (Matrix will be read for each EventID during export)")
+                else:
+                    self.matrix_config = None
+                    print("Transform matrix disabled")
+            except Exception as e:
+                print("Warning: Could not save matrix settings: {0}".format(str(e)))
+                import traceback
+                traceback.print_exc()
+                self.matrix_config = None
+        else:
+            print("Warning: Matrix widget not available")
+            self.matrix_config = None
         
         self.mqt.CloseCurrentDialog(True)
 

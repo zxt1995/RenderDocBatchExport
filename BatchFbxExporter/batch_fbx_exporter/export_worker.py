@@ -19,7 +19,7 @@ class ExportWorker(QtCore.QThread):
     finished_signal = QtCore.Signal(bool, str)  # success, message
     
     def __init__(self, pyrenderdoc, start_index, end_index, output_folder, mapper, 
-                 find_draws_func, export_draw_func):
+                 find_draws_func, export_draw_func, matrix_config=None):
         super().__init__()
         self.pyrenderdoc = pyrenderdoc
         self.start_index = start_index
@@ -29,6 +29,7 @@ class ExportWorker(QtCore.QThread):
         self.is_cancelled = False
         self.find_draws_func = find_draws_func
         self.export_draw_func = export_draw_func
+        self.matrix_config = matrix_config
         
         # Log buffering for smooth UI updates
         self.log_buffer = []
@@ -152,7 +153,8 @@ class ExportWorker(QtCore.QThread):
             logger = DrawCallLogger(self)
             
             try:
-                if self.export_draw_func(controller, draw, self.mapper, self.output_folder, logger):
+                # Note: draw_index parameter removed, using draw.eventId instead
+                if self.export_draw_func(controller, draw, self.mapper, self.output_folder, logger, None, self.matrix_config):
                     success_count += 1
                     # Flush buffer after each successful export to show progress
                     self._flush_log_buffer(force=True)

@@ -1,10 +1,10 @@
 {
     "extension_api": 1,
-    "name": "Batch FBX Exporter",
-    "version": "1.5.1",
+    "name": "Batch FBX Exporter (Auto Matrix)",
+    "version": "2.0.1",
     "minimum_renderdoc": "1.17",
-    "description": "Batch Export FBX and texture files",
+    "description": "Batch export FBX with real-time matrix reading for each EventID (with transpose fix)",
     "author": "Maek",
-    "url": "https://github.com/xxvcxxvc/RenderDocBatchExport"
+    "url": ""
 }
 
