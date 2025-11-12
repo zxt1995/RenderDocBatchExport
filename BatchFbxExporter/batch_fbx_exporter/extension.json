@@ -1,0 +1,10 @@
+{
+    "extension_api": 1,
+    "name": "Batch FBX Exporter",
+    "version": "1.5.1",
+    "minimum_renderdoc": "1.17",
+    "description": "Batch Export FBX and texture files",
+    "author": "Maek",
+    "url": "https://github.com/xxvcxxvc/RenderDocBatchExport"
+}
+
