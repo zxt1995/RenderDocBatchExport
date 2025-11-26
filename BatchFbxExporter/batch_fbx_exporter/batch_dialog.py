@@ -71,6 +71,26 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
         self.variable_edit.setToolTip("Constant Buffer中变量的名称 (大小写敏感)")
         config_layout.addWidget(self.variable_edit, 1, 1, 1, 3)
         
+        # Auto-find Matrix复选框
+        self.autofind_checkbox = QtWidgets.QCheckBox("🔍 自动查找最佳矩阵")
+        self.autofind_checkbox.setToolTip(
+            "如果指定的矩阵无效(最后一列不是0,0,0,1),\n"
+            "自动遍历所有CB查找最符合标准的变换矩阵"
+        )
+        self.autofind_checkbox.setStyleSheet("font-weight: bold; color: #2196F3;")
+        config_layout.addWidget(self.autofind_checkbox, 2, 0, 1, 4)
+        
+        # Transpose Matrix复选框
+        self.transpose_checkbox = QtWidgets.QCheckBox("🔄 转置矩阵 (Column-major → Row-major)")
+        self.transpose_checkbox.setToolTip(
+            "是否对读取的原始矩阵进行转置\n"
+            "• 勾选：将column-major矩阵转置为row-major (Vulkan默认)\n"
+            "• 不勾选：直接使用原始矩阵，不进行转置"
+        )
+        self.transpose_checkbox.setChecked(True)  # 默认启用转置
+        self.transpose_checkbox.setStyleSheet("font-weight: bold; color: #FF9800;")
+        config_layout.addWidget(self.transpose_checkbox, 3, 0, 1, 4)
+        
         # 设置列拉伸
         config_layout.setColumnStretch(4, 1)
         
@@ -125,7 +145,9 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
             'enabled': self.enable_checkbox.isChecked(),
             'set': self.set_spin.value(),
             'binding': self.binding_spin.value(),
-            'variable': self.variable_edit.text()
+            'variable': self.variable_edit.text(),
+            'auto_find': self.autofind_checkbox.isChecked(),
+            'transpose': self.transpose_checkbox.isChecked()
         }
     
     def is_enabled(self):
@@ -145,6 +167,8 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
             target_set = self.set_spin.value()
             target_binding = self.binding_spin.value()
             variable_name = self.variable_edit.text()
+            auto_find_enabled = self.autofind_checkbox.isChecked()
+            transpose_enabled = self.transpose_checkbox.isChecked()
             
             if not variable_name:
                 QtWidgets.QMessageBox.warning(self, "错误", "请输入Variable名称")
@@ -153,6 +177,7 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
             # 存储结果
             result_matrix = [None]
             error_message = [None]
+            debug_messages = [[]]  # 存储调试日志
             
             def read_matrix_test(controller):
                 try:
@@ -167,9 +192,13 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
                     messages = []
                     def log_func(msg):
                         messages.append(msg)
+                        print("[DEBUG] " + msg)  # 同时输出到控制台
                     
-                    # 读取矩阵
-                    matrix = read_matrix_from_renderdoc(controller, target_set, target_binding, variable_name, log_func)
+                    # 读取矩阵（传递auto_find和transpose参数）
+                    matrix = read_matrix_from_renderdoc(controller, target_set, target_binding, variable_name, log_func, auto_find_enabled, transpose_enabled)
+                    
+                    # 保存日志
+                    debug_messages[0] = messages
                     
                     if matrix:
                         result_matrix[0] = matrix
@@ -177,6 +206,8 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
                         error_message[0] = "\n".join(messages) if messages else "无法读取矩阵"
                 except Exception as e:
                     error_message[0] = str(e)
+                    import traceback
+                    debug_messages[0].append("Exception: " + traceback.format_exc())
             
             # 执行测试
             self.pyrenderdoc.Replay().BlockInvoke(read_matrix_test)
@@ -196,6 +227,12 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
                     result_text += "• ✓ 验证通过\n"
                 else:
                     result_text += "• ⚠ 警告: matrix[15]不接近1.0,请确认\n"
+                
+                # 显示调试日志
+                if debug_messages[0]:
+                    result_text += "\n" + "="*50 + "\n"
+                    result_text += "调试日志:\n" + "="*50 + "\n"
+                    result_text += "\n".join(debug_messages[0])
                 
                 QtWidgets.QMessageBox.information(self, '读取成功', result_text)
             else:
@@ -224,6 +261,8 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
         settings.setValue("matrix_auto_set", self.set_spin.value())
         settings.setValue("matrix_auto_binding", self.binding_spin.value())
         settings.setValue("matrix_auto_variable", self.variable_edit.text())
+        settings.setValue("matrix_auto_find", self.autofind_checkbox.isChecked())
+        settings.setValue("matrix_transpose", self.transpose_checkbox.isChecked())
     
     def load_from_settings(self, settings):
         """从配置加载"""
@@ -237,11 +276,21 @@ class MatrixInputWidget(QtWidgets.QGroupBox):
         auto_set = settings.value("matrix_auto_set", 3)
         auto_binding = settings.value("matrix_auto_binding", 1)
         auto_variable = settings.value("matrix_auto_variable", "_child0")
+        auto_find = settings.value("matrix_auto_find", False)
+        transpose = settings.value("matrix_transpose", True)  # 默认启用转置
+        
+        # Convert string to bool if needed
+        if isinstance(auto_find, str):
+            auto_find = auto_find.lower() == 'true'
+        if isinstance(transpose, str):
+            transpose = transpose.lower() == 'true'
         
         try:
             self.set_spin.setValue(int(auto_set))
             self.binding_spin.setValue(int(auto_binding))
             self.variable_edit.setText(str(auto_variable))
+            self.autofind_checkbox.setChecked(bool(auto_find))
+            self.transpose_checkbox.setChecked(bool(transpose))
         except:
             pass
 
@@ -269,6 +318,7 @@ class BatchExportDialog(object):
     start_index = 0
     end_index = 1000
     output_folder = ""
+    export_shader = False  # New: Export shader option
 
     def __init__(self, mqt, pyrenderdoc=None):
         self.mqt = mqt
@@ -433,6 +483,20 @@ class BatchExportDialog(object):
         self.mqt.AddWidget(folder_container, self.folder_edit)
         self.mqt.AddWidget(folder_container, browse_button)
         self.mqt.AddWidget(folder_group, folder_container)
+        
+        # ==================== Shader Export Option ====================
+        shader_container = self.mqt.CreateHorizontalContainer()
+        self.shader_checkbox = QtWidgets.QCheckBox("Export Shader (VS/PS to Unity Shader)")
+        shader_export_enabled = self.settings.value("ExportShader", "false") == "true"
+        self.shader_checkbox.setChecked(shader_export_enabled)
+        self.shader_checkbox.setFixedHeight(24)
+        self.mqt.AddWidget(shader_container, self.shader_checkbox)
+        
+        # Add spacer
+        shader_spacer = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+        shader_container.layout().addItem(shader_spacer)
+        
+        self.mqt.AddWidget(folder_group, shader_container)
         self.mqt.AddWidget(self.widget, folder_group)
 
         # ==================== Attribute Mapping Section ====================
@@ -565,6 +629,11 @@ class BatchExportDialog(object):
         # Get output folder
         self.output_folder = self.mqt.GetWidgetText(self.folder_edit)
         
+        # Get shader export option
+        self.export_shader = self.shader_checkbox.isChecked()
+        self.settings.setValue("ExportShader", "true" if self.export_shader else "false")
+        print("Export Shader: {0}".format(self.export_shader))
+        
         # Save and get transform matrix configuration
         if self.matrix_widget:
             try:
@@ -575,6 +644,8 @@ class BatchExportDialog(object):
                     print("  Set: {0}".format(self.matrix_config['set']))
                     print("  Binding: {0}".format(self.matrix_config['binding']))
                     print("  Variable: {0}".format(self.matrix_config['variable']))
+                    print("  Auto-find: {0}".format(self.matrix_config.get('auto_find', False)))
+                    print("  Transpose: {0}".format(self.matrix_config.get('transpose', True)))
                     print("  (Matrix will be read for each EventID during export)")
                 else:
                     self.matrix_config = None

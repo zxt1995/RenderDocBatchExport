@@ -19,7 +19,7 @@ class ExportWorker(QtCore.QThread):
     finished_signal = QtCore.Signal(bool, str)  # success, message
     
     def __init__(self, pyrenderdoc, start_index, end_index, output_folder, mapper, 
-                 find_draws_func, export_draw_func, matrix_config=None):
+                 find_draws_func, export_draw_func, matrix_config=None, export_shader=False):
         super().__init__()
         self.pyrenderdoc = pyrenderdoc
         self.start_index = start_index
@@ -30,6 +30,7 @@ class ExportWorker(QtCore.QThread):
         self.find_draws_func = find_draws_func
         self.export_draw_func = export_draw_func
         self.matrix_config = matrix_config
+        self.export_shader = export_shader
         
         # Log buffering for smooth UI updates
         self.log_buffer = []
@@ -154,7 +155,34 @@ class ExportWorker(QtCore.QThread):
             
             try:
                 # Note: draw_index parameter removed, using draw.eventId instead
-                if self.export_draw_func(controller, draw, self.mapper, self.output_folder, logger, None, self.matrix_config):
+                fbx_success = self.export_draw_func(controller, draw, self.mapper, self.output_folder, logger, None, self.matrix_config)
+                
+                # Export shader if FBX export succeeded and shader export is enabled
+                if fbx_success and self.export_shader:
+                    event_folder = os.path.join(self.output_folder, str(draw.eventId))
+                    self._log_buffered("  Exporting shader for EventID {0}...".format(draw.eventId))
+                    
+                    # Import shader export function
+                    from . import export_single_event_shader
+                    shader_success, shader_info = export_single_event_shader(controller, draw.eventId, event_folder)
+                    
+                    if shader_success:
+                        self._log_immediate("  ✓ Shader exported successfully (FULL VERSION):")
+                        self._log_immediate("    - SPIR-V bytecode saved")
+                        self._log_immediate("    - HLSL converted")
+                        self._log_immediate("    - Unity Shader generated ({0}.shader)".format(draw.eventId))
+                        self._log_immediate("    - shader_info.json created")
+                        self._log_immediate("    - VS/PS reference files saved")
+                        self._log_immediate("    NOTE: Shader contains complete HLSL code")
+                        self._log_immediate("          May need manual adjustment for Unity")
+                    else:
+                        self._log_immediate("  ⚠ Shader export incomplete/skipped")
+                        self._log_immediate("    Possible reasons:")
+                        self._log_immediate("    - Not a Vulkan capture (DirectX/OpenGL not supported)")
+                        self._log_immediate("    - No shader data available")
+                        self._log_immediate("    - spirv-cross.exe not found (see log above for details)")
+                
+                if fbx_success:
                     success_count += 1
                     # Flush buffer after each successful export to show progress
                     self._flush_log_buffer(force=True)
