@@ -333,7 +333,7 @@ def export_fbx(save_path, mapper, data, attr_list, controller):
                     func()
 
         def run_vertices(self):
-            vertices = [str(v) for idx, values in sorted(vertex_data[POSITION].items()) for v in values[:3]]
+            vertices = [str(v) for idx, values in sorted(vertex_data[POSITION].items()) for v in values[:3][::-1]]
             ARGS["vertices"] = ",".join(vertices)
             ARGS["vertices_num"] = len(vertices)
 
